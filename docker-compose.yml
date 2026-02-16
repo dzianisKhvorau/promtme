@@ -1,0 +1,7 @@
+# Local run: docker compose up --build
+# Env from .env file (do not commit .env with real keys)
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped

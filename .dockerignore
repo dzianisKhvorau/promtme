@@ -1,0 +1,17 @@
+venv
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.md
+!DEPLOY.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+*.png
+*.jpg
