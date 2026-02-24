@@ -9,7 +9,7 @@ import logging
 from functools import lru_cache
 
 from openai import AsyncOpenAI
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -18,6 +18,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -29,7 +30,21 @@ from config import (
     REFINEMENT_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
 )
+import db
 from utils import RateLimiter, split_into_chunks
+
+
+async def _send_pack_invoice(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Send invoice for 50 generations (5 Stars)."""
+    await context.bot.send_invoice(
+        chat_id=chat_id,
+        title=config.INVOICE_TITLE,
+        description=config.INVOICE_DESCRIPTION,
+        payload=config.PAYLOAD_PACK,
+        currency="XTR",
+        prices=[LabeledPrice(config.MSG_BUY_PACK, config.PACK_50_STARS)],
+        provider_token="",
+    )
 
 # --- Logging (no sensitive data in logs) ---
 logging.basicConfig(
@@ -61,6 +76,7 @@ def _category_keyboard(include_help: bool = True) -> InlineKeyboardMarkup:
                 callback_data=Category.TEXT.value,
             ),
         ],
+        [InlineKeyboardButton("🛒 Buy 50 for 5⭐", callback_data="buy50")],
     ]
     if include_help:
         rows.append([InlineKeyboardButton("❓ Help", callback_data="help")])
@@ -221,6 +237,19 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationState.MAIN_MENU
 
 
+async def buy50_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped Buy 50 — send invoice for 5 Stars."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+    chat_id = (query.message.chat_id if query and query.message else None) or (
+        update.effective_chat.id if update.effective_chat else None
+    )
+    if chat_id:
+        await _send_pack_invoice(context, chat_id)
+    return ConversationState.MAIN_MENU
+
+
 async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if query:
@@ -307,6 +336,17 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(config.MSG_RATE_LIMIT, parse_mode="Markdown")
         return ConversationState.AWAITING_DESCRIPTION
 
+    # Freemium: 5 free trial, then balance (buy pack 50 for 5 Stars)
+    if not await db.consume_generation(user_id):
+        await update.message.reply_text(config.MSG_FREE_USED_BUY, parse_mode="Markdown")
+        await _send_pack_invoice(context, update.effective_chat.id)
+        await update.message.reply_text(
+            config.MSG_CHOOSE_CATEGORY,
+            reply_markup=get_category_keyboard(),
+            parse_mode="Markdown",
+        )
+        return ConversationState.MAIN_MENU
+
     system_prompt = SYSTEM_PROMPTS[category]
     status_msg = await update.message.reply_text(config.MSG_SENDING, parse_mode="Markdown")
 
@@ -317,10 +357,7 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except BadRequest:
             pass
 
-        # History: append (keep last N)
-        history = context.user_data.get("history") or []
-        history.append({"category": category_value, "text": result[:200] + ("…" if len(result) > 200 else "")})
-        context.user_data["history"] = history[-config.HISTORY_MAX_ITEMS :]
+        await db.update_after_generation(user_id, category_value, result)
 
         # Send result: header (Markdown), then prompt (plain or word-safe chunks)
         await update.message.reply_text(config.MSG_HERE_PROMPT, parse_mode="Markdown")
@@ -329,10 +366,6 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             for chunk in split_into_chunks(result):
                 await update.message.reply_text(chunk)
-
-        context.user_data["last_prompt"] = result
-        context.user_data["last_category"] = category_value
-        context.user_data["original_description"] = user_text
         await update.message.reply_text(
             config.MSG_APPROVE_OR_REFINE,
             reply_markup=get_approve_refine_keyboard(),
@@ -363,7 +396,8 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_refinement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User sent refinement text — improve the prompt and show again with Approve/Refine."""
     user_id = update.effective_user.id if update.effective_user else 0
-    last_prompt = context.user_data.get("last_prompt")
+    user_row = await db.get_user(user_id)
+    last_prompt = user_row.get("last_prompt")
     if not last_prompt:
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
@@ -385,6 +419,17 @@ async def handle_refinement(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(config.MSG_RATE_LIMIT, parse_mode="Markdown")
         return ConversationState.AWAITING_REFINEMENT
 
+    # Freemium: same balance for refinements
+    if not await db.consume_generation(user_id):
+        await update.message.reply_text(config.MSG_FREE_USED_BUY, parse_mode="Markdown")
+        await _send_pack_invoice(context, update.effective_chat.id)
+        await update.message.reply_text(
+            config.MSG_CHOOSE_CATEGORY,
+            reply_markup=get_category_keyboard(),
+            parse_mode="Markdown",
+        )
+        return ConversationState.MAIN_MENU
+
     user_message = f"Current prompt:\n{last_prompt}\n\nUser's requested changes or additions:\n{user_text}"
     status_msg = await update.message.reply_text(config.MSG_SENDING, parse_mode="Markdown")
 
@@ -394,7 +439,8 @@ async def handle_refinement(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await status_msg.delete()
         except BadRequest:
             pass
-        context.user_data["last_prompt"] = result
+        last_category = user_row.get("last_category") or "text"
+        await db.update_after_generation(user_id, last_category, result)
         await update.message.reply_text(config.MSG_HERE_PROMPT, parse_mode="Markdown")
         if len(result) <= config.MAX_MESSAGE_LENGTH:
             await update.message.reply_text(result)
@@ -435,8 +481,29 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationState.MAIN_MENU
 
 
+async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm payment — required for Telegram to complete the transaction."""
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """After user paid for pack: add 50 to balance."""
+    payment = update.message.successful_payment if update.message else None
+    if not payment or payment.invoice_payload != config.PAYLOAD_PACK:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    new_balance = await db.add_balance(user_id, config.PACK_50_AMOUNT)
+    await update.message.reply_text(
+        config.MSG_BALANCE_ADDED.format(new_balance),
+        parse_mode="Markdown",
+        reply_markup=get_category_keyboard(),
+    )
+    logger.info("Pack purchased, balance=%s for user %s", new_balance, user_id)
+
+
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    history = context.user_data.get("history") or []
+    user_id = update.effective_user.id if update.effective_user else 0
+    history = await db.get_history(user_id)
     if not history:
         await update.message.reply_text(
             config.MSG_HISTORY_EMPTY,
@@ -453,14 +520,20 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def main() -> None:
+    async def on_init(_: Application) -> None:
+        await db.init_db()
+
     application = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
+        .post_init(on_init)
         .build()
     )
 
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("history", cmd_history))
+    application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     async def main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
@@ -474,6 +547,7 @@ def main() -> None:
     main_menu_handlers = [
         CallbackQueryHandler(category_callback, pattern=f"^({category_pattern})$"),
         CallbackQueryHandler(help_callback, pattern="^help$"),
+        CallbackQueryHandler(buy50_callback, pattern="^buy50$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_text),
     ]
     awaiting_handlers = [
@@ -504,6 +578,7 @@ def main() -> None:
         fallbacks=[
             CallbackQueryHandler(category_callback, pattern=f"^({category_pattern})$"),
             CallbackQueryHandler(help_callback, pattern="^help$"),
+            CallbackQueryHandler(buy50_callback, pattern="^buy50$"),
             CallbackQueryHandler(back_callback, pattern="^back$"),
             CallbackQueryHandler(approve_callback, pattern="^approve$"),
             CallbackQueryHandler(refine_callback, pattern="^refine$"),

@@ -1,5 +1,7 @@
 # Local run: docker compose up --build
 # Env from .env file (do not commit .env with real keys)
+# DB is stored in container at /app/bot.db. To persist, mount a volume, e.g.:
+#   volumes: ["./data:/app/data"] and set DATABASE_PATH=/app/data/bot.db in .env
 services:
   bot:
     build: .

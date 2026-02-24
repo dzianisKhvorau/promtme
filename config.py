@@ -53,6 +53,16 @@ DEEPSEEK_RETRY_ATTEMPTS = 3
 RATE_LIMIT_REQUESTS_PER_MINUTE = 5
 HISTORY_MAX_ITEMS = 5
 
+# --- Database (SQLite) ---
+DATABASE_PATH = os.getenv("DATABASE_PATH", str(_script_dir / "data" / "bot.db"))
+
+# --- Freemium (Telegram Stars) ---
+FREE_TRIAL_GENERATIONS = 5  # new users get 5 free generations to try
+PACK_50_STARS = 5  # price in Stars for a pack of 50 generations
+PACK_50_AMOUNT = 50  # generations in the pack
+INVOICE_TITLE = "50 generations"
+INVOICE_DESCRIPTION = "50 AI prompt generations"
+PAYLOAD_PACK = "pack50"
 
 # --- Emojis ---
 EMOJI_IMAGE = "🖼"
@@ -99,6 +109,12 @@ MSG_HISTORY_HEADER = "📜 *Last {} prompts:*\n\n"
 MSG_BACK = "↩️ Back to menu"
 MSG_APPROVE_OR_REFINE = "What next?"
 MSG_SEND_REFINEMENT = "✏️ Send your additional details or changes (e.g. add something, make it shorter, change tone):"
+MSG_FREE_USED_BUY = (
+    "🆓 You've used your *5 free* trial generations.\n\n"
+    "Buy *50 generations* for *5⭐* — tap the button below to pay."
+)
+MSG_BALANCE_ADDED = "✅ *Payment received!* You now have *{}* generations. Try your prompt again 👇"
+MSG_BUY_PACK = "50 generations for 5⭐"
 
 # Raw prompt texts (no escaped newlines for use in code)
 _PROMPT_IMAGE = (
