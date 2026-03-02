@@ -52,6 +52,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _category_keyboard(include_help: bool = True) -> InlineKeyboardMarkup:
