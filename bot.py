@@ -10,7 +10,7 @@ from functools import lru_cache
 
 from openai import AsyncOpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -34,15 +34,17 @@ import db
 from utils import RateLimiter, split_into_chunks
 
 
-async def _send_pack_invoice(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Send invoice for 50 generations (5 Stars)."""
+async def _send_pack_invoice(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, pack: dict
+) -> None:
+    """Send invoice for a pack (pack = one of config.PACKS)."""
     await context.bot.send_invoice(
         chat_id=chat_id,
-        title=config.INVOICE_TITLE,
-        description=config.INVOICE_DESCRIPTION,
-        payload=config.PAYLOAD_PACK,
+        title=pack["title"],
+        description=pack["description"],
+        payload=pack["id"],
         currency="XTR",
-        prices=[LabeledPrice(config.MSG_BUY_PACK, config.PACK_50_STARS)],
+        prices=[LabeledPrice(pack["short_label"], pack["stars"])],
         provider_token="",
     )
 
@@ -55,7 +57,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def _category_keyboard(include_help: bool = True) -> InlineKeyboardMarkup:
+def _category_keyboard(
+    include_help: bool = True, show_buy_buttons: bool = True
+) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -77,17 +81,29 @@ def _category_keyboard(include_help: bool = True) -> InlineKeyboardMarkup:
                 callback_data=Category.TEXT.value,
             ),
         ],
-        [InlineKeyboardButton("🛒 Buy 50 for 5⭐", callback_data="buy50")],
     ]
+    if show_buy_buttons:
+        rows.append(
+            [InlineKeyboardButton(p["short_label"], callback_data=f"buy{p['amount']}") for p in config.PACKS]
+        )
     if include_help:
         rows.append([InlineKeyboardButton("❓ Help", callback_data="help")])
     return InlineKeyboardMarkup(rows)
 
 
-@lru_cache(maxsize=1)
-def get_category_keyboard() -> InlineKeyboardMarkup:
-    """Cached main menu keyboard (categories + Help)."""
-    return _category_keyboard(include_help=True)
+@lru_cache(maxsize=2)
+def get_category_keyboard(show_buy_buttons: bool = True) -> InlineKeyboardMarkup:
+    """Cached main menu keyboard. show_buy_buttons=False until user exhausted free trial."""
+    return _category_keyboard(include_help=True, show_buy_buttons=show_buy_buttons)
+
+
+async def get_category_keyboard_for_user(user_id: int) -> InlineKeyboardMarkup:
+    """Main menu keyboard: buy buttons only if trial exhausted and no paid balance."""
+    user = await db.get_user(user_id)
+    show_buy = (
+        user["free_used"] >= config.FREE_TRIAL_GENERATIONS and user["balance"] <= 0
+    )
+    return get_category_keyboard(show_buy_buttons=show_buy)
 
 
 def get_awaiting_keyboard() -> InlineKeyboardMarkup:
@@ -113,11 +129,13 @@ async def send_main_menu(
     *,
     text: str | None = None,
 ) -> int:
+    user_id = update.effective_user.id if update.effective_user else 0
+    keyboard = await get_category_keyboard_for_user(user_id)
     msg = text or config.MSG_WELCOME
     if update.message:
         await update.message.reply_text(
             msg,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
     else:
@@ -126,7 +144,7 @@ async def send_main_menu(
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=msg,
-                reply_markup=get_category_keyboard(),
+                reply_markup=keyboard,
                 parse_mode="Markdown",
             )
     return ConversationState.MAIN_MENU
@@ -148,10 +166,12 @@ async def entry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update.effective_chat.id if update.effective_chat else None
     )
     if chat_id:
+        user_id = update.effective_user.id if update.effective_user else 0
+        keyboard = await get_category_keyboard_for_user(user_id)
         await context.bot.send_message(
             chat_id=chat_id,
             text=config.MSG_WELCOME,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
     return ConversationState.MAIN_MENU
@@ -238,16 +258,24 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationState.MAIN_MENU
 
 
-async def buy50_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """User tapped Buy 50 — send invoice for 5 Stars."""
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped a pack (buy10 / buy50 / buy200) — send invoice for that pack."""
     query = update.callback_query
     if query:
         await query.answer()
     chat_id = (query.message.chat_id if query and query.message else None) or (
         update.effective_chat.id if update.effective_chat else None
     )
-    if chat_id:
-        await _send_pack_invoice(context, chat_id)
+    if not chat_id or not query or not query.data:
+        return ConversationState.MAIN_MENU
+    amount_str = query.data.replace("buy", "")
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        return ConversationState.MAIN_MENU
+    pack = next((p for p in config.PACKS if p["amount"] == amount), None)
+    if pack:
+        await _send_pack_invoice(context, chat_id, pack)
     return ConversationState.MAIN_MENU
 
 
@@ -259,10 +287,12 @@ async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         update.effective_chat.id if update.effective_chat else None
     )
     if chat_id:
+        user_id = update.effective_user.id if update.effective_user else 0
+        keyboard = await get_category_keyboard_for_user(user_id)
         await context.bot.send_message(
             chat_id=chat_id,
             text=config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
     return ConversationState.MAIN_MENU
@@ -277,10 +307,12 @@ async def approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         update.effective_chat.id if update.effective_chat else None
     )
     if chat_id:
+        user_id = update.effective_user.id if update.effective_user else 0
+        keyboard = await get_category_keyboard_for_user(user_id)
         await context.bot.send_message(
             chat_id=chat_id,
             text=config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
     return ConversationState.MAIN_MENU
@@ -308,18 +340,20 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id if update.effective_user else 0
     category_value = context.user_data.get("category")
     if not category_value:
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
     try:
         category = Category(category_value)
     except ValueError:
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
@@ -339,11 +373,11 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Freemium: 5 free trial, then balance (buy pack 50 for 5 Stars)
     if not await db.consume_generation(user_id):
-        await update.message.reply_text(config.MSG_FREE_USED_BUY, parse_mode="Markdown")
-        await _send_pack_invoice(context, update.effective_chat.id)
+        await update.message.reply_text(config.MSG_NO_GENERATIONS_LEFT, parse_mode="Markdown")
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
@@ -384,9 +418,10 @@ async def handle_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await status_msg.edit_text(err_msg, parse_mode="Markdown")
         except Exception:
             await update.message.reply_text(err_msg, parse_mode="Markdown")
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
@@ -400,9 +435,10 @@ async def handle_refinement(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_row = await db.get_user(user_id)
     last_prompt = user_row.get("last_prompt")
     if not last_prompt:
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
@@ -422,11 +458,11 @@ async def handle_refinement(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # Freemium: same balance for refinements
     if not await db.consume_generation(user_id):
-        await update.message.reply_text(config.MSG_FREE_USED_BUY, parse_mode="Markdown")
-        await _send_pack_invoice(context, update.effective_chat.id)
+        await update.message.reply_text(config.MSG_NO_GENERATIONS_LEFT, parse_mode="Markdown")
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
@@ -474,9 +510,11 @@ async def handle_refinement(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id if update.effective_user else 0
+    keyboard = await get_category_keyboard_for_user(user_id)
     await update.message.reply_text(
         config.MSG_CANCEL,
-        reply_markup=get_category_keyboard(),
+        reply_markup=keyboard,
         parse_mode="Markdown",
     )
     return ConversationState.MAIN_MENU
@@ -488,16 +526,18 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """After user paid for pack: add 50 to balance."""
+    """After user paid for a pack: add pack amount to balance."""
     payment = update.message.successful_payment if update.message else None
-    if not payment or payment.invoice_payload != config.PAYLOAD_PACK:
+    if not payment or payment.invoice_payload not in config.PAYLOAD_TO_AMOUNT:
         return
     user_id = update.effective_user.id if update.effective_user else 0
-    new_balance = await db.add_balance(user_id, config.PACK_50_AMOUNT)
+    amount = config.PAYLOAD_TO_AMOUNT[payment.invoice_payload]
+    new_balance = await db.add_balance(user_id, amount)
+    keyboard = await get_category_keyboard_for_user(user_id)
     await update.message.reply_text(
         config.MSG_BALANCE_ADDED.format(new_balance),
         parse_mode="Markdown",
-        reply_markup=get_category_keyboard(),
+        reply_markup=keyboard,
     )
     logger.info("Pack purchased, balance=%s for user %s", new_balance, user_id)
 
@@ -537,9 +577,11 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     async def main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user_id = update.effective_user.id if update.effective_user else 0
+        keyboard = await get_category_keyboard_for_user(user_id)
         await update.message.reply_text(
             config.MSG_CHOOSE_CATEGORY,
-            reply_markup=get_category_keyboard(),
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return ConversationState.MAIN_MENU
@@ -548,7 +590,7 @@ def main() -> None:
     main_menu_handlers = [
         CallbackQueryHandler(category_callback, pattern=f"^({category_pattern})$"),
         CallbackQueryHandler(help_callback, pattern="^help$"),
-        CallbackQueryHandler(buy50_callback, pattern="^buy50$"),
+        CallbackQueryHandler(buy_callback, pattern="^buy(10|50|200)$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_text),
     ]
     awaiting_handlers = [
@@ -579,7 +621,7 @@ def main() -> None:
         fallbacks=[
             CallbackQueryHandler(category_callback, pattern=f"^({category_pattern})$"),
             CallbackQueryHandler(help_callback, pattern="^help$"),
-            CallbackQueryHandler(buy50_callback, pattern="^buy50$"),
+            CallbackQueryHandler(buy_callback, pattern="^buy(10|50|200)$"),
             CallbackQueryHandler(back_callback, pattern="^back$"),
             CallbackQueryHandler(approve_callback, pattern="^approve$"),
             CallbackQueryHandler(refine_callback, pattern="^refine$"),
@@ -590,7 +632,13 @@ def main() -> None:
     application.add_handler(conv_handler)
 
     async def on_error(_update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.exception("Unhandled error: %s", context.error)
+        err = context.error
+        if isinstance(err, Conflict) and "getUpdates" in str(err):
+            logger.warning(
+                "Another bot instance is polling (Conflict). Use only one instance with long-polling, or switch to webhook."
+            )
+            return
+        logger.exception("Unhandled error: %s", err)
 
     application.add_error_handler(on_error)
     logger.info("Bot starting (long-polling)")
